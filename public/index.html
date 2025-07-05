@@ -1,0 +1,152 @@
+case 'deployvercel': {
+  const axios = require('axios');
+  const unzipper = require('unzipper');
+  const crypto = require('crypto');
+  const { downloadMediaMessage } = require('@whiskeysockets/baileys');
+
+  if (!m.quoted || !m.quoted.message.documentMessage)
+    return m.reply('Balas file .zip dengan perintah:\ndeployvercel token|namaproject');
+
+  if (!text.includes('|')) return m.reply('Format salah!\nContoh: deployvercel token|projectku');
+
+  const [token, projectName] = text.split('|');
+  if (!token || !projectName) return m.reply('Token atau nama project tidak valid.');
+
+  const mimetype = m.quoted.message.documentMessage.mimetype || '';
+  if (!mimetype.includes('zip')) return m.reply('File bukan ZIP');
+
+  let statusMsg = await conn.sendMessage(m.chat, {
+    text: '📦 Membaca dan memproses file ZIP...'
+  }, { quoted: m });
+
+  try {
+    const buffer = await downloadMediaMessage(m.quoted, 'buffer', {}, { logger: console });
+    const zipEntries = await unzipper.Open.buffer(buffer);
+
+    const filesMeta = [];
+    const filesContent = {};
+
+    const folderNames = new Set();
+    for (const entry of zipEntries.files) {
+      if (entry.path.includes('/')) {
+        const rootFolder = entry.path.split('/')[0];
+        folderNames.add(rootFolder);
+      }
+    }
+    const mainFolder = folderNames.size === 1 ? Array.from(folderNames)[0] : null;
+
+    for (const entry of zipEntries.files) {
+      if (entry.type !== 'File') continue;
+
+      const content = await entry.buffer();
+      const sha = crypto.createHash('sha1').update(content).digest('hex');
+
+      let cleanPath = entry.path.replace(/^\/+/, '').replace(/\\/g, '/');
+      if (mainFolder && cleanPath.startsWith(mainFolder + '/')) {
+        cleanPath = cleanPath.replace(mainFolder + '/', '');
+      }
+
+      filesMeta.push({
+        file: cleanPath,
+        sha,
+        size: content.length
+      });
+
+      filesContent[sha] = content;
+    }
+
+    if (!filesMeta.length)
+      return conn.sendMessage(m.chat, { edit: statusMsg.key, text: '❌ ZIP kosong atau gagal dibaca.' });
+
+    await conn.sendMessage(m.chat, {
+      edit: statusMsg.key,
+      text: '🚀 Mengunggah file ke Vercel...'
+    });
+
+    for (const file of filesMeta) {
+      const check = await axios.get(`https://api.vercel.com/v2/files/${file.sha}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      }).catch(() => null);
+
+      if (!check || check.status === 404) {
+        await axios.post(`https://api.vercel.com/v2/files`, filesContent[file.sha], {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': file.size,
+            'x-vercel-digest': file.sha
+          }
+        });
+      }
+    }
+
+    const deployRes = await axios.post('https://api.vercel.com/v13/deployments', {
+      name: projectName,
+      files: filesMeta,
+      target: 'production',
+      projectSettings: {
+        framework: null,
+        devCommand: null,
+        installCommand: null,
+        buildCommand: null,
+        outputDirectory: null,
+        rootDirectory: null
+      }
+    }, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const deploymentId = deployRes.data.id;
+
+    await conn.sendMessage(m.chat, {
+      edit: statusMsg.key,
+      text: '⏳ Menunggu hingga deployment READY...'
+    });
+
+    let ready = false;
+    let attempts = 0;
+    while (!ready && attempts < 10) {
+      await new Promise(res => setTimeout(res, 3000));
+      const status = await axios.get(`https://api.vercel.com/v13/deployments/${deploymentId}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (status.data.readyState === 'READY') {
+        ready = true;
+      }
+      attempts++;
+    }
+
+    if (!ready) {
+      return conn.sendMessage(m.chat, {
+        edit: statusMsg.key,
+        text: '❌ Gagal deploy ke Vercel: Deployment belum READY setelah beberapa percobaan.'
+      });
+    }
+
+    await axios.post(`https://api.vercel.com/v2/deployments/${deploymentId}/aliases`, {
+      alias: `${projectName}.vercel.app`
+    }, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    await conn.sendMessage(m.chat, {
+      edit: statusMsg.key,
+      text: `✅ Berhasil deploy ke Vercel!\n\n› Project: ${projectName}\n› URL: https://${projectName}.vercel.app`
+    });
+
+  } catch (err) {
+    const e = err?.response?.data || err.message;
+    console.error('[ERR]', e);
+    await conn.sendMessage(m.chat, {
+      edit: statusMsg.key,
+      text: `❌ Gagal deploy ke Vercel:\n${typeof e === 'string' ? e : JSON.stringify(e, null, 2)}`
+    });
+  }
+}
+break
